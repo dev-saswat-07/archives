@@ -1,0 +1,205 @@
+name: Update Syllabus RAG Knowledge Base
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'   # 2 AM UTC every Sunday
+  workflow_dispatch:      # Manual trigger
+
+jobs:
+  update-rag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository (with full history for change detection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4 pymupdf \
+                      chromadb sentence-transformers tqdm
+
+      - name: Run RAG pipeline
+        shell: python
+        run: |
+          import os, json, hashlib, shutil
+          from datetime import datetime
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          import fitz
+          from sentence_transformers import SentenceTransformer
+          import chromadb
+          from chromadb.config import Settings
+
+          # ========== CONFIGURATION ==========
+          BASE_URL = "https://fmuniversity.nic.in"
+          START_URLS = [f"{BASE_URL}/pg_syllabus.html", f"{BASE_URL}/archives.html"]
+          DATA_DIR = "rag_data"
+          VECTOR_DB_DIR = os.path.join(DATA_DIR, "chroma_db")
+          MANIFEST_FILE = os.path.join(DATA_DIR, "manifest.json")
+          EMBED_MODEL = "all-MiniLM-L6-v2"   # Lightweight, runs in GitHub Actions
+
+          os.makedirs(DATA_DIR, exist_ok=True)
+
+          # ========== STEP 1: CRAWL & EXTRACT ==========
+          print("🔍 Crawling for PDFs...")
+          visited = set()
+          pdf_urls = set()
+
+          def get_soup(url):
+              resp = requests.get(url, timeout=30)
+              resp.raise_for_status()
+              return BeautifulSoup(resp.text, "html.parser")
+
+          def crawl(url):
+              if url in visited:
+                  return
+              visited.add(url)
+              print(f"  Visiting: {url}")
+              try:
+                  soup = get_soup(url)
+              except Exception as e:
+                  print(f"  ⚠️ Failed: {e}")
+                  return
+              for a in soup.find_all("a", href=True):
+                  href = a["href"].strip()
+                  if not href or href.startswith("#"):
+                      continue
+                  full = urljoin(url, href)
+                  if not full.startswith(BASE_URL):
+                      continue
+                  if full.lower().endswith(".pdf"):
+                      pdf_urls.add(full)
+                  elif any(k in full.lower() for k in ["syllabus", "pg", "archives", "year"]):
+                      crawl(full)
+
+          for start in START_URLS:
+              crawl(start)
+
+          print(f"\n📄 Found {len(pdf_urls)} unique PDFs.\n")
+
+          # Load previous manifest to detect changes
+          prev_manifest = {}
+          if os.path.exists(MANIFEST_FILE):
+              with open(MANIFEST_FILE, "r") as f:
+                  prev_manifest = json.load(f)
+
+          new_manifest = {}
+          new_texts = []      # (url, text, metadata)
+          updated = False
+
+          for pdf_url in pdf_urls:
+              try:
+                  resp = requests.get(pdf_url, timeout=60)
+                  resp.raise_for_status()
+                  content_hash = hashlib.md5(resp.content).hexdigest()
+
+                  # Check if this PDF has changed
+                  if pdf_url in prev_manifest and prev_manifest[pdf_url]["hash"] == content_hash:
+                      print(f"⏭️  Unchanged: {pdf_url}")
+                      new_manifest[pdf_url] = prev_manifest[pdf_url]
+                      continue
+
+                  print(f"⬇️  Processing: {pdf_url}")
+                  # Extract text
+                  doc = fitz.open(stream=resp.content, filetype="pdf")
+                  text = "\n".join(page.get_text() for page in doc)
+                  if not text.strip():
+                      print(f"    ⚠️ No text extracted, skipping")
+                      continue
+
+                  updated = True
+                  new_manifest[pdf_url] = {
+                      "hash": content_hash,
+                      "downloaded": datetime.utcnow().isoformat(),
+                      "size_bytes": len(resp.content)
+                  }
+                  new_texts.append({
+                      "url": pdf_url,
+                      "text": text,
+                      "hash": content_hash
+                  })
+              except Exception as e:
+                  print(f"❌ Error {pdf_url}: {e}")
+
+          # Save new manifest
+          with open(MANIFEST_FILE, "w") as f:
+              json.dump(new_manifest, f, indent=2)
+
+          if not updated and os.path.exists(VECTOR_DB_DIR):
+              print("\n✅ No changes detected. RAG database is up to date.")
+              exit(0)
+
+          # ========== STEP 2: CHUNK & EMBED ==========
+          print("\n🧠 Chunking and embedding new/updated documents...")
+
+          # Initialize embedding model (cached after first run)
+          model = SentenceTransformer(EMBED_MODEL)
+
+          # Initialize Chroma with persistence
+          client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+          collection = client.get_or_create_collection("syllabi")
+
+          # If this is a full update, we could clear old embeddings.
+          # But to be precise, we delete only the updated documents.
+          # For simplicity, we'll use upsert (overwrites by ID).
+          ids_to_upsert = []
+          documents = []
+          metadatas = []
+          embeddings = []
+
+          CHUNK_SIZE = 500
+          CHUNK_OVERLAP = 50
+
+          for item in new_texts:
+              text = item["text"]
+              url = item["url"]
+              doc_hash = item["hash"]
+
+              # Simple chunking by sentences (or characters)
+              words = text.split()
+              for i in range(0, len(words), CHUNK_SIZE - CHUNK_OVERLAP):
+                  chunk = " ".join(words[i:i+CHUNK_SIZE])
+                  chunk_id = f"{doc_hash}_{i}"
+                  ids_to_upsert.append(chunk_id)
+                  documents.append(chunk)
+                  metadatas.append({"source": url, "chunk_index": i//(CHUNK_SIZE - CHUNK_OVERLAP)})
+                  # Embed batch for efficiency
+                  if len(documents) >= 32:
+                      batch_emb = model.encode(documents).tolist()
+                      embeddings.extend(batch_emb)
+                      documents.clear()
+
+          if documents:
+              batch_emb = model.encode(documents).tolist()
+              embeddings.extend(batch_emb)
+
+          if ids_to_upsert:
+              collection.upsert(
+                  ids=ids_to_upsert,
+                  embeddings=embeddings,
+                  metadatas=metadatas,
+                  documents=documents   # also store raw text for retrieval
+              )
+              print(f"✅ Upserted {len(ids_to_upsert)} chunks into vector database.")
+          else:
+              print("ℹ️ No new chunks to add.")
+
+          # ========== STEP 3: COMMIT UPDATED VECTOR DB ==========
+          print("\n💾 Committing updated vector store to repository...")
+          # The auto-commit action will handle this
+
+      - name: Commit updated RAG data
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update RAG knowledge base [skip ci]"
+          file_pattern: "rag_data/*"
